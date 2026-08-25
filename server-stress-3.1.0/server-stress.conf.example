@@ -1,0 +1,20 @@
+# server-stress SMTP configuration example.
+# Copy to ~/.config/server-stress/smtp.conf and set mode 0600.
+# Keep credentials out of this file: choose password_env or password_file.
+[smtp]
+host = smtp.example.com
+port = 587
+security = starttls
+username = stress-reports@example.com
+from = stress-reports@example.com
+to = operations@example.com
+password_env = SERVER_STRESS_SMTP_PASSWORD
+password_file =
+timeout = 30
+max_attachment_bytes = 26214400
+# false 时只发 Word 与 Markdown 报告，不附证据归档
+attach_archive = true
+
+# QQ 邮箱使用：host = smtp.qq.com、port = 465、security = ssl。
+# 请使用 QQ 邮箱网页端生成的 SMTP 授权码，并写入独立的 password_file；
+# 直接运行 `bash server-stress.sh` 会交互创建安全的 QQ 配置。

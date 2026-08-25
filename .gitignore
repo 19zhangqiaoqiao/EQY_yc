@@ -1,0 +1,9 @@
+# 本机 SMTP 凭据、报告、归档和运行证据绝不能进入版本库。
+*.conf
+*.password
+qq-smtp-auth
+server-stress-runs/
+*.tar.gz
+*.tar.gz.sha256
+server-stress-3.1.0-示例报告.docx
+server-stress-3.1.0-示例报告.md
