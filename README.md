@@ -3,6 +3,7 @@
 ```bash
 git clone https://github.com/19zhangqiaoqiao/EQY_yc.git
 cd EQY_yc
+chmod +x server-stress-3.1.0/server-stress.sh
 bash server-stress.sh
 ```
 
