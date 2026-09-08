@@ -1,5 +1,20 @@
 # 更新记录
 
+## 3.1.1
+
+**GPU 高负载**
+
+- GPU 阶段新增 GPU-burn 后端；默认优先使用已安装的 GPU-burn，以 Tensor Core 矩阵负载和 90% 可用显存提升 NVIDIA GPU 利用率
+- 新增 `--gpu-backend auto|gpu-burn|cuda`，可强制使用 GPU-burn 或原有 CUDA 可逆校验后端
+- 新增 `--install-gpu-burn`：只有明确传入该参数才会从官方 `wilicc/gpu-burn` 仓库下载、编译并缓存，不会在默认压测中联网下载
+- 自动记录 GPU-burn 的来源提交、GPU compute capability、构建参数和运行后端；GPU-burn 缺失或构建失败时，`auto` 模式会回退 CUDA 后端
+- GPU 指标表新增压测后端字段，区分 GPU-burn Tensor Core 压力测试和内置 CUDA 逐轮可逆校验
+
+**兼容与验证**
+
+- CUDA 工具链缺少 `gcc` 时，GPU 日志现在会明确提示该依赖，而不是只给出笼统失败结论
+- 新增 GPU 后端参数、显式联网安装和 Tensor Core/显存上限的回归测试
+
 ## 3.1.0
 
 **压测强度**

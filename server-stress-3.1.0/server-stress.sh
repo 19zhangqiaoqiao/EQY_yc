@@ -21,7 +21,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 umask 077
 
-readonly VERSION=3.1.0
+readonly VERSION=3.1.1
 readonly PROGRAM=server-stress
 readonly DEFAULT_OUT=/var/tmp/server-stress-runs
 readonly DEFAULT_DISK=/var/tmp
@@ -72,6 +72,10 @@ SCRATCH_FILE=''
 SCRATCH_DEV=''
 SCRATCH_INO=''
 GPU_BINARY=''
+GPU_BACKEND=auto           # auto | gpu-burn | cuda
+INSTALL_GPU_BURN=0
+GPU_BACKEND_USED=''
+GPU_BURN_MEMORY=90
 
 declare -a ALL_STAGES=(cpu memory disk gpu mixed)
 declare -a STAGES=()
@@ -103,6 +107,8 @@ QQ 发件邮箱必须在网页端开启 SMTP 并使用授权码，不能输入 Q
   --dry-run                只校验、采集证据并出报告，不施加压力
   --self-test-safe         安全自检模式，不施加压力
   --email                  发送报告与证据归档
+  --gpu-backend NAME       GPU 后端：auto | gpu-burn | cuda（默认 auto）
+  --install-gpu-burn       缺少 GPU-burn 时从官方仓库下载、编译并缓存
   -h, --help               显示帮助
 
 范围与强度
@@ -121,7 +127,7 @@ QQ 发件邮箱必须在网页端开启 SMTP 并使用授权码，不能输入 Q
 
 默认 3600s 计划：CPU 480、内存 720、磁盘 720（4 个等长任务）、GPU 600、混合 1080。
 自定义时长按同比例分配；只选部分阶段时，时长在所选阶段之间按权重重新分配。
-报告为中文，同时输出 Markdown 与 Word(docx)。CUDA/NVIDIA 永不安装。
+报告为中文，同时输出 Markdown 与 Word(docx)。除非明确传入 --install-gpu-burn，否则不会下载 GPU-burn 或安装 NVIDIA 软件。
 磁盘测试文件受上限约束，每个 fio 任务都有硬墙钟超时。
 EOF
 }
@@ -210,6 +216,12 @@ parse() {
             --output-dir) need "$@"; OUT=$2; shift 2 ;;
             --disk-dir) need "$@"; DISK_DIR=$2; shift 2 ;;
             --config) need "$@"; CONFIG=$2; shift 2 ;;
+            --gpu-backend)
+                need "$@"
+                case $2 in auto|gpu-burn|cuda) GPU_BACKEND=$2 ;; *) die 'invalid --gpu-backend (use auto|gpu-burn|cuda)' ;; esac
+                shift 2
+                ;;
+            --install-gpu-burn) INSTALL_GPU_BURN=1; shift ;;
             --stages) need "$@"; requested=$2; shift 2 ;;
             --skip-stages) need "$@"; skipped=$2; shift 2 ;;
             --cpu-workers) need "$@"; need_int --cpu-workers "$2" 1 4096; CPU_WORKERS=$2; shift 2 ;;
@@ -239,6 +251,10 @@ parse() {
             *) die "unknown option: $1" ;;
         esac
     done
+
+    if ((INSTALL_GPU_BURN)) && [[ $GPU_BACKEND == cuda ]]; then
+        die '--install-gpu-burn cannot be used with --gpu-backend cuda'
+    fi
 
     # 阶段选择：先取 --stages（缺省全选），再挖掉 --skip-stages。
     # 命令替换在子 shell 里执行，非法阶段名必须靠退出码兜住，否则会被静默忽略。
@@ -1048,6 +1064,98 @@ compile_cuda() {
     return 1
 }
 
+gpu_burn_cache_dir() {
+    printf '%s' "${XDG_CACHE_HOME:-${HOME:-/root}/.cache}/server-stress/gpu-burn"
+}
+
+find_gpu_burn() {
+    local candidate
+    for candidate in "$(command -v gpu_burn 2>/dev/null || true)" "$(gpu_burn_cache_dir)/gpu_burn"; do
+        [[ -n $candidate && -x $candidate && ! -L $candidate ]] || continue
+        GPU_BINARY=$candidate
+        return 0
+    done
+    return 1
+}
+
+gpu_compute_capability() {
+    local cap
+    cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '[:space:].')
+    [[ $cap =~ ^[0-9]{2,3}$ ]] || return 1
+    printf '%s' "$cap"
+}
+
+install_gpu_burn() {
+    local cache source cap revision
+    cache=$(gpu_burn_cache_dir)
+    source="$cache/source"
+    for command in git make nvcc gcc g++; do
+        command -v "$command" >/dev/null ||
+            { log "GPU-burn requires $command; install it first, then retry."; return 1; }
+    done
+    cap=$(gpu_compute_capability) ||
+        { log 'cannot detect NVIDIA compute capability for GPU-burn build'; return 1; }
+    mkdir -p -- "$cache"
+    chmod 700 "$cache"
+    if [[ ! -d $source/.git ]]; then
+        rm -rf -- "$source"
+        log 'Downloading GPU-burn from official wilicc/gpu-burn repository...'
+        git clone --depth 1 https://github.com/wilicc/gpu-burn.git "$source" || return 1
+    fi
+    revision=$(git -C "$source" rev-parse HEAD 2>/dev/null || printf unknown)
+    {
+        printf 'gpu_burn_source=wilicc/gpu-burn\n'
+        printf 'gpu_burn_revision=%s\n' "$revision"
+        printf 'gpu_burn_compute=%s\n' "$cap"
+        printf 'gpu_burn_memory_percent=%s\n' "$GPU_BURN_MEMORY"
+    } >>"$1"
+    (cd "$source" && make clean && make "COMPUTE=$cap") >>"$1" 2>&1 || return 1
+    [[ -x $source/gpu_burn && ! -L $source/gpu_burn ]] || return 1
+    install -m 700 "$source/gpu_burn" "$cache/gpu_burn"
+    GPU_BINARY="$cache/gpu_burn"
+}
+
+prepare_gpu_backend() {
+    local logfile=$1
+    GPU_BINARY=''
+    GPU_BACKEND_USED=''
+    if [[ $GPU_BACKEND != cuda ]]; then
+        if find_gpu_burn; then
+            GPU_BACKEND_USED=gpu-burn
+            printf 'gpu_backend=gpu-burn binary=%s memory_percent=%s tensor_cores=try\n' \
+                "$GPU_BINARY" "$GPU_BURN_MEMORY" >>"$logfile"
+            return 0
+        fi
+        if ((INSTALL_GPU_BURN)) && install_gpu_burn "$logfile"; then
+            GPU_BACKEND_USED=gpu-burn
+            return 0
+        fi
+        printf 'gpu_burn_unavailable=1 install_requested=%s\n' "$INSTALL_GPU_BURN" >>"$logfile"
+        [[ $GPU_BACKEND == auto ]] || return 1
+        log 'GPU-burn is unavailable; falling back to the built-in CUDA verifier.'
+    fi
+    command -v nvcc >/dev/null ||
+        { printf 'cuda_unavailable=nvcc-not-found\n' >>"$logfile"; return 1; }
+    command -v gcc >/dev/null ||
+        { printf 'cuda_unavailable=gcc-not-found\n' >>"$logfile"; return 1; }
+    write_cuda_source
+    compile_cuda "$logfile" || return 1
+    GPU_BACKEND_USED=cuda
+}
+
+run_gpu_workload() {
+    local logfile=$1 seconds=$2
+    case $GPU_BACKEND_USED in
+        gpu-burn)
+            run_cmd "$logfile" "$seconds" "$GPU_BINARY" -tc -m "${GPU_BURN_MEMORY}%" "$seconds"
+            ;;
+        cuda)
+            run_cmd "$logfile" "$seconds" "$GPU_BINARY" "$seconds"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 run_gpu() {
     local stage=gpu
     if ((DRY || SAFE)); then safe_stage "$stage"; return; fi
@@ -1061,19 +1169,17 @@ run_gpu() {
         result "$stage" UNTESTED '未检测到NVIDIA设备'
         return
     fi
-    if ! command -v nvcc >/dev/null; then
+    if prepare_gpu_backend "$logfile" && run_gpu_workload "$logfile" "${SEC[$stage]}"; then
         stage_end "$stage"
-        result "$stage" UNTESTED '有NVIDIA设备但系统没有现成nvcc'
-        return
-    fi
-
-    write_cuda_source
-    if compile_cuda "$logfile" && run_cmd "$logfile" "${SEC[$stage]}" "$GPU_BINARY" "${SEC[$stage]}"; then
-        stage_end "$stage"
-        result "$stage" PASS '全部可见GPU并发计算与逐轮可逆校验通过'
+        printf 'gpu_backend=%s status=PASS\n' "$GPU_BACKEND_USED" >>"$logfile"
+        if [[ $GPU_BACKEND_USED == gpu-burn ]]; then
+            result "$stage" PASS 'GPU-burn Tensor Core 高负载与错误校验通过'
+        else
+            result "$stage" PASS '全部可见GPU并发计算与逐轮可逆校验通过'
+        fi
     else
         stage_end "$stage"
-        result "$stage" FAIL 'CUDA编译/探测/压测或校验失败'
+        result "$stage" FAIL 'GPU-burn/CUDA 构建、探测、压测或校验失败'
     fi
 }
 
@@ -1147,11 +1253,16 @@ run_mixed() {
     fi
 
     if [[ ${STATUS[gpu]:-UNTESTED} == PASS && -n $GPU_BINARY && -x $GPU_BINARY && ! -L $GPU_BINARY ]]; then
-        setsid timeout --signal=TERM --kill-after=10s "$((SEC[$stage] + 20))s" \
-            "$GPU_BINARY" "${SEC[$stage]}" >>"$logfile" 2>&1 &
+        if [[ $GPU_BACKEND_USED == gpu-burn ]]; then
+            setsid timeout --signal=TERM --kill-after=10s "$((SEC[$stage] + 20))s" \
+                "$GPU_BINARY" -tc -m "${GPU_BURN_MEMORY}%" "${SEC[$stage]}" >>"$logfile" 2>&1 &
+        else
+            setsid timeout --signal=TERM --kill-after=10s "$((SEC[$stage] + 20))s" \
+                "$GPU_BINARY" "${SEC[$stage]}" >>"$logfile" 2>&1 &
+        fi
         pid_gpu=$!
         track "$pid_gpu"
-        gpu_scope=all-visible
+        gpu_scope="all-visible/$GPU_BACKEND_USED"
     else
         partial=1
         missing_scope+=(GPU)
@@ -2414,10 +2525,19 @@ def gpu_metrics(run):
         seen.add(key)
         items.append({'index': match.group(1),
                       'name': names.get(match.group(1), 'unknown'),
+                      'backend': 'cuda',
                       'status': match.group(2),
                       'verify_errors': int(match.group(3)),
                       'compute_sweeps': int(match.group(4)),
                       'bytes': int(match.group(5))})
+    for match in re.finditer(r'gpu_backend=(gpu-burn)\s+status=(PASS|FAIL)', text):
+        items.append({'index': 'all',
+                      'name': 'GPU-burn Tensor Core',
+                      'backend': match.group(1),
+                      'status': match.group(2),
+                      'verify_errors': 0,
+                      'compute_sweeps': 0,
+                      'bytes': 0})
     return items
 
 
@@ -2755,23 +2875,24 @@ def build(run):
     blocks.append(('h2', '4.3 GPU'))
     gpu_rows = []
     for item in performance.get('gpu') or []:
-        gpu_rows.append([item.get('index', 'NA'), item.get('name', 'NA'),
+        memory = human_bytes(item.get('bytes')) if item.get('bytes') else 'GPU-burn 自管'
+        gpu_rows.append([item.get('index', 'NA'), item.get('name', 'NA'), item.get('backend', 'cuda'),
                          {'text': STATUS_CN.get(item.get('status'), item.get('status', 'NA')),
                           'style': STATUS_STYLE.get(item.get('status'), 'warn')},
                          str(item.get('compute_sweeps', 0)),
                          str(item.get('verify_errors', 0)),
-                         human_bytes(item.get('bytes'))])
+                         memory])
     if gpu_rows:
         blocks.append(('table', {
-            'header': ['卡号', '型号', '结论', '计算轮次', '校验错误', '占用显存'],
-            'align': ['c', 'l', 'c', 'r', 'r', 'r'],
-            'widths': [7, 26, 10, 12, 12, 14],
+            'header': ['卡号', '型号', '后端', '结论', '计算轮次', '校验错误', '占用显存'],
+            'align': ['c', 'l', 'l', 'c', 'r', 'r', 'r'],
+            'widths': [7, 22, 14, 10, 12, 12, 14],
             'rows': gpu_rows,
         }))
-        blocks.append(('p', '每一轮都做正向变换、显存带宽读取、反向变换与全量图案比对，'
-                            '过程中出现的位翻转会被立即发现，而不是只在开始时校验一次。'))
+        blocks.append(('p', 'GPU-burn 后端使用 Tensor Core 矩阵负载与校验，目标是持续高 GPU 利用率；'
+                            'CUDA 后端每轮做正向变换、显存带宽读取、反向变换与全量图案比对。'))
     else:
-        blocks.append(('p', '没有 GPU 指标（无 NVIDIA 设备、缺少现成的 nvcc，或该阶段未执行）。'))
+        blocks.append(('p', '没有 GPU 指标（无 NVIDIA 设备、GPU-burn/CUDA 工具链不可用，或该阶段未执行）。'))
 
     # 五、运行期遥测汇总
     blocks.append(('h1', '五、运行期遥测汇总'))

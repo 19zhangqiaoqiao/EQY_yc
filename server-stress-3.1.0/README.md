@@ -2,7 +2,7 @@
 
 `server-stress` 是面向 Ubuntu/Debian 服务器的整机压力测试与取证脚本。报告为**中文**，同时输出 **Markdown 和 Word(.docx)** 两份，方便直接发给不看 Markdown 的人。
 
-它只执行检查、测试和报告，不调整系统参数、不修复问题，也不会安装 NVIDIA 驱动、CUDA 或其他 NVIDIA 软件包。
+它只执行检查、测试和报告，不调整系统参数、不修复问题，也不会安装 NVIDIA 驱动、CUDA 或其他 NVIDIA 软件包。GPU-burn 只有在显式传入 `--install-gpu-burn` 时才会下载、编译并缓存。
 
 > 压力测试会显著占用 CPU、内存、磁盘和（条件满足时）GPU。请先在维护窗口运行 `preflight` 和安全模式，并确认业务、备份与监控状态。
 
@@ -13,7 +13,7 @@
 - 磁盘 fio 默认使用 `libaio`（不可用时依次回退 `io_uring`、`sync`），带队列深度和多 job 并发。3.0 用的是队列深度 1 的 `sync`，在 NVMe 上只能压出真实能力的很小一部分。
 - 正式测试前先做一次 4 秒带宽探测：既用来确认引擎真的可用，也用来给测试文件定尺，保证文件能在时间预算内铺开，不会因为文件过大让 fio 拖过计划时间。
 - 磁盘测试文件会先用 fio 完整预铺一遍，避免读测试读到文件系统空洞、测出虚高的成绩。
-- GPU 负载改为每一轮都做「正向变换 → 显存带宽读取 → 反向变换 → 全量图案比对」。变换是可逆的，因此压测过程中任何一次位翻转都会被抓到；3.0 只在开始时校验一次。
+- GPU 默认优先使用 GPU-burn 的 Tensor Core 矩阵负载（90% 可用显存），通常能把 NVIDIA GPU 打到更高利用率；GPU-burn 不可用时回退到内置 CUDA 可逆校验负载。
 - CPU 阶段启用 `--cpu-method all` 轮换算法，内存阶段启用 `--vm-method all` 与 `--oom-avoid`（按 stress-ng 实际支持情况自动启用）。
 
 **报告与结果**
@@ -143,7 +143,7 @@ sudo server-stress run --id dc1-db03-ticket-4821
 | CPU | 480 | `stress-ng` CPU 满载，轮换计算方法 |
 | memory | 720 | 有明确上限的内存负载，带校验 |
 | disk | 720 | 四个等长 fio 任务：顺序写、顺序读、4K 随机读、4K 随机读写 7:3 |
-| GPU | 600 | 条件满足时运行 CUDA 负载，逐轮可逆校验 |
+| GPU | 600 | 优先 GPU-burn Tensor Core 高负载；不可用时回退 CUDA 可逆校验 |
 | mixed | 1080 | CPU / 内存 / 磁盘 /（可用时）GPU 同时加压 |
 
 自定义总时长按上述比例整数分配，余数也会被纳入，报告表格中各阶段秒数之和始终等于 `--duration`。
@@ -194,7 +194,20 @@ sudo server-stress run --id dc1-web17-maint --no-install-deps
 
 在 `--no-install-deps` 下，正式运行遇到缺失依赖会拒绝继续。`--dry-run` 和 `--self-test-safe` 始终跳过依赖安装。
 
-脚本会自动探测 NVIDIA 设备。只有同时检测到 NVIDIA 硬件和已经存在的 `nvcc` 时，才会编译并运行受时限约束的 GPU 负载；编译先尝试 `-arch=native`，失败则退回默认架构。它绝不安装 NVIDIA 驱动、CUDA 或 NVIDIA/CUDA 软件包。硬件或工具链缺失时 GPU 阶段标记为 `UNTESTED`。
+脚本会自动探测 NVIDIA 设备，并优先使用已安装的 `gpu_burn`（GPU-burn）。该后端以 `-tc -m 90%` 运行 Tensor Core 矩阵负载，通常能显著提高 GPU 利用率；GPU-burn 不存在时，默认 `auto` 模式会回退到内置 CUDA 可逆校验负载。可使用 `--gpu-backend cuda` 强制旧后端，或用 `--gpu-backend gpu-burn` 强制 GPU-burn。
+
+若服务器没有 GPU-burn，只有明确传入 `--install-gpu-burn` 时才会从官方 `wilicc/gpu-burn` 仓库下载、编译并缓存到当前用户的 `~/.cache/server-stress/gpu-burn/`。这要求服务器可访问 GitHub，且已有 `git`、`make`、`gcc`、`g++`、`nvcc` 和 CUDA BLAS 开发库；脚本不会自动安装 NVIDIA 驱动或 CUDA 软件包。
+
+```bash
+# 首次下载、构建 GPU-burn，并只做一分钟 GPU 高负载验证
+server-stress run --id gpu-burn-check --stages gpu --duration 60s \
+  --gpu-backend gpu-burn --install-gpu-burn
+
+# 后续已缓存时，无需联网或再次编译
+server-stress run --id gpu-burn-1h --stages gpu --duration 1h --gpu-backend gpu-burn
+```
+
+GPU-burn 会大幅增加 GPU 功耗和温度。消费级显卡应确认散热、风扇和供电正常，并在维护窗口执行。
 
 ## 磁盘和内存边界
 

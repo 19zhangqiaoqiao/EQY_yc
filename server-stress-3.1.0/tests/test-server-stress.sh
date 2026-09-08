@@ -187,11 +187,25 @@ assert_contains 'unknown stage names the offender' "$LAST_OUTPUT" 'bogus'
 invoke run --self-test-safe --no-install-deps --output-dir "$TMP_ROOT/runs" --id opt-check --stages cpu,bogus
 assert_eq 'partially valid stage list is rejected' '2' "$LAST_RC"
 
-for bad_option in '--mem-percent 99' '--disk-iodepth 0' '--telemetry-interval 61' '--report-format pdf' '--disk-engine nvme'; do
+for bad_option in '--mem-percent 99' '--disk-iodepth 0' '--telemetry-interval 61' '--report-format pdf' '--disk-engine nvme' '--gpu-backend opencl'; do
     # shellcheck disable=SC2086
     invoke run --self-test-safe --no-install-deps --output-dir "$TMP_ROOT/runs" --id opt-check $bad_option
     assert_eq "out-of-range option is rejected: $bad_option" '2' "$LAST_RC"
 done
+
+invoke run --self-test-safe --no-install-deps --output-dir "$TMP_ROOT/runs" --id opt-check --gpu-backend cuda --install-gpu-burn
+assert_eq 'GPU-burn install is rejected with CUDA-only backend' '2' "$LAST_RC"
+
+if grep -Fq 'if ((INSTALL_GPU_BURN)) && install_gpu_burn' "$SCRIPT"; then
+    pass 'GPU-burn download requires explicit install option'
+else
+    fail 'GPU-burn download requires explicit install option'
+fi
+if grep -Fq -- '-tc -m "${GPU_BURN_MEMORY}%"' "$SCRIPT"; then
+    pass 'GPU-burn uses Tensor Core and bounded memory load'
+else
+    fail 'GPU-burn uses Tensor Core and bounded memory load'
+fi
 
 invoke run --self-test-safe --no-install-deps --output-dir "$TMP_ROOT/runs" --id opt-check --duration 59
 assert_eq 'too-short duration is rejected' '2' "$LAST_RC"
@@ -227,7 +241,7 @@ assert_contains 'report includes telemetry section' "$(<"$REPORT_1")" '五、运
 assert_contains 'report includes health counter table' "$(<"$REPORT_1")" '六、健康计数差值'
 assert_not_contains 'report leaves no unformatted placeholder' "$(<"$REPORT_1")" '%s'
 invoke version
-assert_contains 'version reports 3.1.0' "$LAST_OUTPUT" '3.1.0'
+assert_contains 'version reports 3.1.1' "$LAST_OUTPUT" '3.1.1'
 
 stage_sum="$(python3 - "$REPORT_1" <<'PY'
 import re
