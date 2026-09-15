@@ -1,4 +1,7 @@
 # 服务器整机压力测试工具
+
+当前版本：3.1.2。GPU 压测新增 NVIDIA/NVML 持续健康检查；驱动异常只影响实际故障阶段，不会把此前通过的 CPU、内存和磁盘统一误判为失败。命令行和报告均为专业纯文字界面。
+
 前置条件：显卡驱动，CUDA工具包，gcc/g++工具
 ```bash
 git clone https://github.com/19zhangqiaoqiao/EQY_yc.git

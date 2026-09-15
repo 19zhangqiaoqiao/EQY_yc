@@ -21,7 +21,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 umask 077
 
-readonly VERSION=3.1.1
+readonly VERSION=3.1.2
 readonly PROGRAM=server-stress
 readonly DEFAULT_OUT=/var/tmp/server-stress-runs
 readonly DEFAULT_DISK=/var/tmp
@@ -76,6 +76,11 @@ GPU_BACKEND=auto           # auto | gpu-burn | cuda
 INSTALL_GPU_BURN=0
 GPU_BACKEND_USED=''
 GPU_BURN_MEMORY=90
+GPU_DRIVER_UNHEALTHY=0
+GPU_CRITICAL_HEALTH=0
+NVIDIA_EXPECTED_COUNT=''
+NVIDIA_EXPECTED_DRIVER=''
+NVIDIA_HEALTH_REASON=''
 
 declare -a ALL_STAGES=(cpu memory disk gpu mixed)
 declare -a STAGES=()
@@ -367,8 +372,24 @@ missing() {
     done
 }
 
+packages_for_commands() {
+    local command
+    while IFS= read -r command; do
+        case $command in
+            python3) printf 'python3\n' ;;
+            stress-ng) printf 'stress-ng\n' ;;
+            fio) printf 'fio\n' ;;
+            tar) printf 'tar\n' ;;
+            gzip) printf 'gzip\n' ;;
+            flock|setsid|findmnt) printf 'util-linux\n' ;;
+            timeout|sha256sum) printf 'coreutils\n' ;;
+            *) die "no package mapping for required command: $command" ;;
+        esac
+    done | awk '!seen[$0]++'
+}
+
 install_deps() {
-    local -a lacking
+    local -a lacking packages
     mapfile -t lacking < <(missing)
     ((${#lacking[@]} == 0)) && return 0
     log "Missing tools: ${lacking[*]}"
@@ -381,10 +402,19 @@ install_deps() {
 
     local -a sudo_prefix=()
     ((EUID)) && sudo_prefix=(sudo)
+    mapfile -t packages < <(printf '%s\n' "${lacking[@]}" | packages_for_commands)
+    ((${#packages[@]})) || die 'no packages selected for missing tools'
     "${sudo_prefix[@]}" env DEBIAN_FRONTEND=noninteractive apt-get update
-    "${sudo_prefix[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        stress-ng fio python3 tar gzip util-linux coreutils findutils procps sysstat \
-        lm-sensors ethtool nvme-cli smartmontools ipmitool pciutils
+    local transaction
+    transaction=$("${sudo_prefix[@]}" env DEBIAN_FRONTEND=noninteractive \
+        apt-get --simulate install --no-install-recommends --no-upgrade "${packages[@]}") ||
+        die 'apt dependency simulation failed'
+    if grep -Eiq '^(Inst|Remv|Conf)[[:space:]].*(nvidia|cuda|libnvidia)' <<<"$transaction"; then
+        log "$transaction"
+        die 'refusing dependency transaction that changes NVIDIA/CUDA packages; update drivers separately and reboot first'
+    fi
+    "${sudo_prefix[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        --no-install-recommends --no-upgrade "${packages[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -456,7 +486,68 @@ nvidia_present() {
     if [[ -d /proc/driver/nvidia/gpus ]] && compgen -G '/proc/driver/nvidia/gpus/*' >/dev/null; then
         return 0
     fi
-    return 1
+    command -v lspci >/dev/null &&
+        lspci -Dn 2>/dev/null | grep -Eqi '^[0-9a-f:.]+[[:space:]]+030[02]:[[:space:]]+10de:'
+}
+
+nvidia_health_check() {
+    local label=$1 logfile=$2 output count driver loaded='' ondisk='' detail
+    local proc_version=${NVIDIA_PROC_VERSION_FILE:-/proc/driver/nvidia/version}
+    NVIDIA_HEALTH_REASON=''
+    if ! command -v nvidia-smi >/dev/null; then
+        NVIDIA_HEALTH_REASON=nvidia-smi-not-found
+        printf 'nvidia_health label=%s status=FAIL reason=nvidia-smi-not-found\n' "$label" >>"$logfile"
+        return 1
+    fi
+    if ! output=$(timeout 15s nvidia-smi \
+            --query-gpu=index,uuid,driver_version --format=csv,noheader,nounits 2>&1); then
+        detail=$(tr '\r\n' '  ' <<<"$output")
+        NVIDIA_HEALTH_REASON=nvml-query-failed
+        [[ $output == *'Driver/library version mismatch'* ]] &&
+            NVIDIA_HEALTH_REASON=driver-library-version-mismatch
+        printf 'nvidia_health label=%s status=FAIL reason=%s detail=%q\n' \
+            "$label" "$NVIDIA_HEALTH_REASON" "$detail" >>"$logfile"
+        return 1
+    fi
+    count=$(grep -cve '^[[:space:]]*$' <<<"$output")
+    driver=$(awk -F, 'NR==1 {gsub(/^[ \t]+|[ \t]+$/, "", $3); print $3}' <<<"$output")
+    [[ $count =~ ^[1-9][0-9]*$ && $driver =~ ^[0-9.]+$ ]] || {
+        NVIDIA_HEALTH_REASON=invalid-nvml-output
+        printf 'nvidia_health label=%s status=FAIL reason=invalid-nvml-output\n' "$label" >>"$logfile"
+        return 1
+    }
+    if [[ -r $proc_version ]]; then
+        loaded=$(sed -nE 's/.*Kernel Module[[:space:]]+([0-9.]+).*/\1/p' \
+            "$proc_version" | head -n 1)
+    fi
+    if command -v modinfo >/dev/null; then
+        ondisk=$(modinfo -F version nvidia 2>/dev/null | head -n 1 || true)
+    fi
+    printf 'nvidia_health label=%s status=PASS count=%s driver=%s loaded_module=%s disk_module=%s\n' \
+        "$label" "$count" "$driver" "${loaded:-NA}" "${ondisk:-NA}" >>"$logfile"
+
+    if [[ -n $loaded && $loaded != "$driver" ]]; then
+        NVIDIA_HEALTH_REASON=driver-loaded-module-mismatch
+        printf 'nvidia_health label=%s status=FAIL reason=driver-loaded-module-mismatch\n' \
+            "$label" >>"$logfile"
+        return 1
+    fi
+    if [[ -n $loaded && -n $ondisk && $loaded != "$ondisk" ]]; then
+        NVIDIA_HEALTH_REASON=loaded-disk-module-mismatch
+        printf 'nvidia_health label=%s status=FAIL reason=loaded-disk-module-mismatch reboot_required=1\n' \
+            "$label" >>"$logfile"
+        return 1
+    fi
+    if [[ -z $NVIDIA_EXPECTED_COUNT ]]; then
+        NVIDIA_EXPECTED_COUNT=$count
+        NVIDIA_EXPECTED_DRIVER=$driver
+    elif [[ $count != "$NVIDIA_EXPECTED_COUNT" || $driver != "$NVIDIA_EXPECTED_DRIVER" ]]; then
+        NVIDIA_HEALTH_REASON=inventory-changed
+        printf 'nvidia_health label=%s status=FAIL reason=inventory-changed expected_count=%s expected_driver=%s\n' \
+            "$label" "$NVIDIA_EXPECTED_COUNT" "$NVIDIA_EXPECTED_DRIVER" >>"$logfile"
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -593,6 +684,34 @@ snapshots() {
 health() {
     local phase=$1
     python3 "$HELPERS/health.py" "$RUN/health-${phase}.json" "$phase" || true
+}
+
+critical_health_delta() {
+    local phase=$1
+    python3 - "$RUN/health-${phase}-before.json" "$RUN/health-${phase}-after.json" <<'PY'
+import json
+import sys
+
+bad = ('oom', 'edac_ue', 'xid', 'nvme_media', 'aer_uncorrected',
+       'gpu_ecc_uncorrected')
+
+def load(path):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return json.load(handle)
+    except Exception:
+        return {}
+
+before, after = load(sys.argv[1]), load(sys.argv[2])
+items = []
+if before.get('boot_id') != after.get('boot_id'):
+    items.append('boot_id_changed')
+for key in bad:
+    start, end = before.get(key), after.get(key)
+    if isinstance(start, int) and isinstance(end, int) and end > start:
+        items.append('%s+%d' % (key, end - start))
+print(','.join(items))
+PY
 }
 
 starttele() {
@@ -1145,15 +1264,39 @@ prepare_gpu_backend() {
 
 run_gpu_workload() {
     local logfile=$1 seconds=$2
+    local -a command
     case $GPU_BACKEND_USED in
         gpu-burn)
-            run_cmd "$logfile" "$seconds" "$GPU_BINARY" -tc -m "${GPU_BURN_MEMORY}%" "$seconds"
+            command=("$GPU_BINARY" -tc -m "${GPU_BURN_MEMORY}%" "$seconds")
             ;;
         cuda)
-            run_cmd "$logfile" "$seconds" "$GPU_BINARY" "$seconds"
+            command=("$GPU_BINARY" "$seconds")
             ;;
         *) return 1 ;;
     esac
+
+    setsid timeout --signal=TERM --kill-after=10s "$((seconds + 20))s" \
+        "${command[@]}" >>"$logfile" 2>&1 &
+    local pid=$! rc
+    track "$pid"
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 5
+        kill -0 "$pid" 2>/dev/null || break
+        if ! nvidia_health_check gpu-runtime "$logfile"; then
+            GPU_DRIVER_UNHEALTHY=1
+            printf 'gpu_guard action=terminate reason=%s\n' "$NVIDIA_HEALTH_REASON" >>"$logfile"
+            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+            set +e
+            wait "$pid"
+            set -e
+            return 125
+        fi
+    done
+    set +e
+    wait "$pid"
+    rc=$?
+    set -e
+    return "$rc"
 }
 
 run_gpu() {
@@ -1169,8 +1312,44 @@ run_gpu() {
         result "$stage" UNTESTED '未检测到NVIDIA设备'
         return
     fi
-    if prepare_gpu_backend "$logfile" && run_gpu_workload "$logfile" "${SEC[$stage]}"; then
+    if ! nvidia_health_check gpu-before "$logfile"; then
+        GPU_DRIVER_UNHEALTHY=1
         stage_end "$stage"
+        result "$stage" FAIL "NVIDIA驱动栈不可用（$NVIDIA_HEALTH_REASON），未启动GPU压力"
+        return
+    fi
+
+    local workload_ok=0
+    if prepare_gpu_backend "$logfile"; then
+        if [[ $GPU_BACKEND_USED == gpu-burn && ${SEC[$stage]} -ge 30 ]]; then
+            if run_gpu_workload "$logfile" 10; then
+                if ! nvidia_health_check gpu-after-probe "$logfile"; then
+                    GPU_DRIVER_UNHEALTHY=1
+                elif run_gpu_workload "$logfile" "$((${SEC[$stage]} - 10))"; then
+                    workload_ok=1
+                fi
+            fi
+        elif run_gpu_workload "$logfile" "${SEC[$stage]}"; then
+            workload_ok=1
+        fi
+    fi
+
+    local failure_reason=${NVIDIA_HEALTH_REASON:-}
+    local driver_ok=1
+    if ! nvidia_health_check gpu-after "$logfile"; then
+        GPU_DRIVER_UNHEALTHY=1
+        driver_ok=0
+        failure_reason=$NVIDIA_HEALTH_REASON
+    fi
+    stage_end "$stage"
+    local critical
+    critical=$(critical_health_delta "$stage")
+    if [[ -n $critical ]]; then
+        GPU_CRITICAL_HEALTH=1
+        workload_ok=0
+        printf 'gpu_guard critical_health=%s action=skip-mixed\n' "$critical" >>"$logfile"
+    fi
+    if ((workload_ok && driver_ok)); then
         printf 'gpu_backend=%s status=PASS\n' "$GPU_BACKEND_USED" >>"$logfile"
         if [[ $GPU_BACKEND_USED == gpu-burn ]]; then
             result "$stage" PASS 'GPU-burn Tensor Core 高负载与错误校验通过'
@@ -1178,8 +1357,13 @@ run_gpu() {
             result "$stage" PASS '全部可见GPU并发计算与逐轮可逆校验通过'
         fi
     else
-        stage_end "$stage"
-        result "$stage" FAIL 'GPU-burn/CUDA 构建、探测、压测或校验失败'
+        if [[ -n $critical ]]; then
+            result "$stage" FAIL "GPU阶段出现关键健康异常（$critical），已停止后续混合压测"
+        elif ((GPU_DRIVER_UNHEALTHY)); then
+            result "$stage" FAIL "GPU压力期间NVIDIA驱动异常（${failure_reason:-runtime-failure}），已终止负载"
+        else
+            result "$stage" FAIL 'GPU-burn/CUDA 构建、压测或校验失败；NVIDIA驱动仍可访问'
+        fi
     fi
 }
 
@@ -1190,15 +1374,30 @@ run_mixed() {
     local stage=mixed
     if ((DRY || SAFE)); then safe_stage "$stage"; return; fi
 
+    local logfile="$RUN/raw/mixed.log"
+    : >"$logfile"
+    if ((GPU_DRIVER_UNHEALTHY || GPU_CRITICAL_HEALTH)); then
+        stage_start "$stage"
+        printf 'mixed_skipped=1 reason=gpu-health-guard\n' >>"$logfile"
+        stage_end "$stage"
+        result "$stage" INCOMPLETE 'GPU驱动或关键健康计数异常，为保护系统未执行混合负载'
+        return
+    fi
+    if [[ ${STATUS[gpu]:-UNTESTED} == PASS ]] &&
+            ! nvidia_health_check mixed-before "$logfile"; then
+        GPU_DRIVER_UNHEALTHY=1
+        stage_start "$stage"
+        stage_end "$stage"
+        result "$stage" INCOMPLETE "NVIDIA驱动状态变化（$NVIDIA_HEALTH_REASON），未执行混合负载"
+        return
+    fi
+
     sizes                    # 重新采样一次可用内存，避免沿用前面阶段的旧值
     if ((DISK_BYTES >= 256 * 1024 * 1024)); then
         ensure_disk_engine
         size_disk_file
     fi
     stage_start "$stage"
-
-    local logfile="$RUN/raw/mixed.log"
-    : >"$logfile"
 
     local cpu_workers
     cpu_workers=$(nproc)
@@ -1291,7 +1490,11 @@ run_mixed() {
         wait "$pid_gpu"
         local gpu_rc=$?
         set -e
-        ((gpu_rc == 0 || gpu_rc == 124)) || rc=1
+        ((gpu_rc == 0)) || rc=1
+        if ! nvidia_health_check mixed-after "$logfile"; then
+            GPU_DRIVER_UNHEALTHY=1
+            rc=1
+        fi
     fi
 
     if ((do_disk)); then
@@ -2348,6 +2551,7 @@ def health_summary(run):
     verdict = 'PASS'
     warnings = []
     notes = []
+    critical_by_phase = {}
 
     for phase in list(STAGES) + ['run']:
         before = load_json('%s/health-%s-before.json' % (run, phase))
@@ -2376,17 +2580,23 @@ def health_summary(run):
                 delta[key] = None
         deltas[phase] = delta
 
+        critical = []
         if delta.get('boot_id', {}).get('changed'):
             verdict = 'FAIL'
+            critical.append('boot_id_changed')
         for key in BAD_KEYS:
             if isinstance(delta.get(key), int) and delta[key] > 0:
                 verdict = 'FAIL'
+                critical.append('%s+%d' % (key, delta[key]))
+        if critical:
+            critical_by_phase[phase] = critical
         if phase != 'run':
             for key in WARN_KEYS:
                 if isinstance(delta.get(key), int) and delta[key] > 0:
                     warnings.append('%s:%s+%d' % (phase, key, delta[key]))
 
     return {'health_deltas': deltas, 'health_verdict': verdict,
+            'critical_by_phase': critical_by_phase,
             'warnings': warnings, 'notes': notes}
 
 
@@ -2541,6 +2751,21 @@ def gpu_metrics(run):
     return items
 
 
+def nvidia_health_metrics(run):
+    text = read_text('%s/raw/gpu.log' % run) + '\n' + read_text('%s/raw/mixed.log' % run)
+    records = {}
+    for line in text.splitlines():
+        if not line.startswith('nvidia_health '):
+            continue
+        values = dict(re.findall(r'(\w+)=([^\s]+)', line))
+        label = values.get('label', 'unknown')
+        record = records.setdefault(label, {'label': label})
+        record.update(values)
+        if values.get('status') == 'FAIL':
+            record['status'] = 'FAIL'
+    return list(records.values())
+
+
 # --------------------------------------------------------------------------
 # 遥测统计
 # --------------------------------------------------------------------------
@@ -2597,6 +2822,8 @@ def overall_verdict(rows, health):
     statuses = [rows.get(stage, {}).get('status', 'INCOMPLETE') for stage in STAGES]
     if 'FAIL' in statuses:
         return 'FAIL'
+    if health.get('health_verdict') == 'FAIL':
+        return 'FAIL'
     if any(s in ('INCOMPLETE', 'UNTESTED', 'SKIPPED') for s in statuses):
         return 'PARTIAL'
     if health.get('warnings'):
@@ -2612,23 +2839,26 @@ def main():
     health = health_summary(run)
     write_json('%s/health-summary.json' % run, health)
 
-    performance = {'fio': fio_metrics(run), 'stress_ng': sng_metrics(run), 'gpu': gpu_metrics(run)}
+    performance = {'fio': fio_metrics(run), 'stress_ng': sng_metrics(run),
+                   'gpu': gpu_metrics(run), 'nvidia_health': nvidia_health_metrics(run)}
     write_json('%s/performance.json' % run, performance)
 
     telemetry = telemetry_summary(run)
     write_json('%s/telemetry-summary.json' % run, telemetry)
 
     rows = read_results(run)
-    # 关键健康计数恶化时，已通过的阶段一律翻成失败，并把改判追加进证据
-    if health.get('health_verdict') == 'FAIL':
-        with open('%s/results.tsv' % run, 'a', encoding='utf-8') as f:
-            for stage in STAGES:
-                row = rows.get(stage)
-                if row and row['status'] == 'PASS':
-                    row['status'] = 'FAIL'
-                    row['detail'] = row['detail'] + '；关键健康计数恶化'
-                    f.write('\t'.join([stage, 'FAIL', str(row['planned_seconds']),
-                                       str(row['actual_seconds']), row['detail']]) + '\n')
+    # 关键健康异常只归属到发生异常的阶段。run 级汇总仍会让总体结论失败，
+    # 但不会把此前已经完成且健康的 CPU、内存、磁盘阶段全部误改为失败。
+    critical_by_phase = health.get('critical_by_phase') or {}
+    with open('%s/results.tsv' % run, 'a', encoding='utf-8') as f:
+        for stage in STAGES:
+            critical = critical_by_phase.get(stage) or []
+            row = rows.get(stage)
+            if critical and row and row['status'] == 'PASS':
+                row['status'] = 'FAIL'
+                row['detail'] = row['detail'] + '；本阶段关键健康异常：' + ','.join(critical)
+                f.write('\t'.join([stage, 'FAIL', str(row['planned_seconds']),
+                                   str(row['actual_seconds']), row['detail']]) + '\n')
 
     overall = overall_verdict(rows, health)
     actual_total = sum(rows.get(stage, {}).get('actual_seconds', 0) for stage in STAGES)
@@ -2873,6 +3103,22 @@ def build(run):
         blocks.append(('p', '没有采集到 fio 指标（磁盘阶段未执行或未产生有效 IO）。'))
 
     blocks.append(('h2', '4.3 GPU'))
+    nvidia_rows = []
+    for item in performance.get('nvidia_health') or []:
+        nvidia_rows.append([
+            item.get('label', 'NA'), item.get('status', 'NA'), item.get('count', 'NA'),
+            item.get('driver', 'NA'), item.get('loaded_module', 'NA'),
+            item.get('disk_module', 'NA'), item.get('reason', ''),
+        ])
+    if nvidia_rows:
+        blocks.append(('table', {
+            'header': ['检查点', '状态', '卡数', '驱动', '已加载模块', '磁盘模块', '异常原因'],
+            'align': ['l', 'c', 'r', 'l', 'l', 'l', 'l'],
+            'widths': [18, 9, 7, 12, 14, 14, 22],
+            'rows': nvidia_rows,
+        }))
+        blocks.append(('p', '若出现 driver-library-version-mismatch 或 loaded-disk-module-mismatch，'
+                            '应先统一 NVIDIA 驱动组件并重启；本工具不会自动重载或修改驱动。'))
     gpu_rows = []
     for item in performance.get('gpu') or []:
         memory = human_bytes(item.get('bytes')) if item.get('bytes') else 'GPU-burn 自管'
@@ -2985,8 +3231,10 @@ def build(run):
     blocks.append(('p', '原始日志、fio JSON、遥测 CSV、环境快照与健康计数已作为证据保留在运行目录，'
                         '并打包进 archive-*.tar.gz，附 manifest.sha256 校验清单。'))
     blocks.append(('p', '本脚本只做测试与报告，不调整系统参数、不修复问题，也从不安装 NVIDIA 驱动、'
-                        'CUDA 或任何 NVIDIA 软件包。GPU 阶段只在同时存在 NVIDIA 硬件和现成 nvcc 时执行。'))
-    blocks.append(('p', '结论口径：任一阶段失败或关键健康计数恶化为「失败」；存在未完成/未测/未执行为'
+                        'CUDA 或任何 NVIDIA 软件包。GPU 阶段优先使用 GPU-burn，并在运行前后持续检查 NVML、'
+                        '驱动模块版本和可见 GPU 数量；异常时终止 GPU 负载。'))
+    blocks.append(('p', '结论口径：任一阶段失败或关键健康计数恶化为「失败」；关键异常只改判实际发生异常的'
+                        '阶段，不会连带改写此前已通过阶段；存在未完成/未测/未执行为'
                         '「部分通过」；只有非关键健康告警为「通过（有告警）」；其余为「通过」。'))
     blocks.append(('p', '报告生成时间：%s（UTC）' % time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
     return blocks, metadata, results, performance

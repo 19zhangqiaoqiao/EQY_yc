@@ -6,6 +6,14 @@
 
 > 压力测试会显著占用 CPU、内存、磁盘和（条件满足时）GPU。请先在维护窗口运行 `preflight` 和安全模式，并确认业务、备份与监控状态。
 
+## 3.1.2 GPU 驱动保护
+
+3.1.2 会在 GPU-burn 启动前、短时探测后、正式运行中和运行后检查 NVML、已加载 NVIDIA 内核模块、磁盘模块版本及可见 GPU 数量。发现驱动/库版本不匹配或 GPU 消失时会立即停止 GPU 负载，并跳过后续混合压测。
+
+报告中的阶段结论现在按故障实际发生阶段归属。例如 GPU 阶段出现 Xid 或 NVML 故障时，整体结论仍为失败，但此前已经完成的 CPU、内存和磁盘会保持通过，不再被统一改判。
+
+Git 版命令行与报告采用纯文字和标准表格，不包含 emoji、动画或装饰图标。
+
 ## 3.1 相对 3.0 的变化
 
 **压测强度**
@@ -185,7 +193,7 @@ sudo server-stress run --id dc1-tight --duration 1h --mem-percent 30
 
 ## 依赖与 NVIDIA 行为
 
-正式运行会检查 `python3`、`stress-ng`、`fio`、`tar`、`gzip`、`flock`、`timeout`、`setsid`、`sha256sum`、`findmnt`。缺失标准依赖时，脚本默认通过 Ubuntu/Debian 的 `apt-get` 自动安装；非 root 用户需要可用的 `sudo`。若不允许修改软件包状态，请使用：
+正式运行会检查 `python3`、`stress-ng`、`fio`、`tar`、`gzip`、`flock`、`timeout`、`setsid`、`sha256sum`、`findmnt`。缺失标准依赖时，脚本默认通过 Ubuntu/Debian 的 `apt-get` 只安装实际缺失的通用工具，并使用 `--no-upgrade`。安装前会模拟 apt 事务；若计划触碰 NVIDIA、CUDA 或 libnvidia 软件包则拒绝执行。非 root 用户需要可用的 `sudo`。若不允许修改软件包状态，请使用：
 
 ```bash
 server-stress preflight --id dc1-web17-preflight --no-install-deps
@@ -208,6 +216,8 @@ server-stress run --id gpu-burn-1h --stages gpu --duration 1h --gpu-backend gpu-
 ```
 
 GPU-burn 会大幅增加 GPU 功耗和温度。消费级显卡应确认散热、风扇和供电正常，并在维护窗口执行。
+
+若日志或报告出现 `driver-library-version-mismatch` 或 `loaded-disk-module-mismatch`，表示用户态 NVML、当前已加载的内核驱动或磁盘上的驱动模块版本不一致。停止业务后优先重启服务器并再次运行 `nvidia-smi`；若重启后仍失败，应由管理员统一 NVIDIA 驱动安装来源和版本。本工具不会自动重装、卸载或重载驱动。
 
 ## 磁盘和内存边界
 
@@ -356,7 +366,7 @@ server-stress status
 - `UNTESTED`：不具备适用硬件或现成工具链，例如 NVIDIA/nvcc 不可用；
 - `SKIPPED`：按 `--stages` / `--skip-stages` 未执行。
 
-总体状态口径：任一阶段 `FAIL` 或关键健康计数恶化为 `FAIL`；存在 `INCOMPLETE` / `UNTESTED` / `SKIPPED` 为 `PARTIAL`；只有非关键健康告警为 `PASS WITH WARNINGS`；其余为 `PASS`。
+总体状态口径：任一阶段 `FAIL` 或关键健康计数恶化为 `FAIL`；关键异常只改判实际发生异常的阶段，不连带改写此前阶段；存在 `INCOMPLETE` / `UNTESTED` / `SKIPPED` 为 `PARTIAL`；只有非关键健康告警为 `PASS WITH WARNINGS`；其余为 `PASS`。
 
 | 退出码 | 含义 |
 |---:|---|

@@ -139,6 +139,31 @@ if grep -nE '^[[:space:]]*password[[:space:]]*=' "$SCRIPT" >"$TMP_ROOT/password.
 else
     pass 'source contains no inline password config key'
 fi
+if python3 - "$SCRIPT" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+icons = {chr(code) for code in (
+    0x2705, 0x274C, 0x26A0, 0x1F525, 0x1F680, 0x1F4BB, 0x1F9E0,
+    0x1F4BE, 0x1F3AE, 0x1F527, 0x1F4E7, 0x1F4CA, 0x2699, 0x1F5A5,
+    0x1F7E2, 0x1F534, 0x1F7E1)}
+raise SystemExit(1 if any(char in text for char in icons) else 0)
+PY
+then
+    pass 'Git CLI and report source contain no decorative icons'
+else
+    fail 'Git CLI and report source contain no decorative icons'
+fi
+assert_true 'dependency install performs apt simulation first' grep -Fq 'apt-get --simulate install' "$SCRIPT"
+assert_true 'dependency install prevents upgrades' grep -Fq -- '--no-upgrade "${packages[@]}"' "$SCRIPT"
+assert_true 'dependency install blocks NVIDIA transactions' grep -Fq \
+    'refusing dependency transaction that changes NVIDIA/CUDA packages' "$SCRIPT"
+assert_true 'NVIDIA containers retain nvidia-smi hardware detection' grep -Fq \
+    'nvidia-smi -L >/dev/null 2>&1' "$SCRIPT"
+assert_true 'mixed GPU timeout is not accepted as success' grep -Fq \
+    '((gpu_rc == 0)) || rc=1' "$SCRIPT"
+assert_true 'GPU critical health guard skips mixed load' grep -Fq \
+    '((GPU_DRIVER_UNHEALTHY || GPU_CRITICAL_HEALTH))' "$SCRIPT"
 
 # fio 的 --filename 必须是绝对路径。传相对路径时它只在 --directory 已被解析的
 # 情况下才落到测试目录，否则会写到当前工作目录去 —— 那测的就不是目标磁盘了。
@@ -147,6 +172,85 @@ if grep -nE -- '--filename=("?\$\(basename|[^"$/])' "$SCRIPT" >"$TMP_ROOT/filena
 else
     pass 'fio test file is always an absolute path'
 fi
+
+# 用假的 nvidia-smi 验证 NVML 版本不匹配与可见卡数变化会被阻止。
+awk '/^nvidia_health_check\(\) {/,/^}/' "$SCRIPT" >"$TMP_ROOT/nvidia-health-function.sh"
+cat >"$TMP_ROOT/bin/nvidia-smi" <<'EOF'
+#!/usr/bin/env bash
+case ${NVIDIA_STUB_MODE:-healthy} in
+    mismatch)
+        printf '%s\n' 'Failed to initialize NVML: Driver/library version mismatch' >&2
+        exit 1
+        ;;
+    one)
+        printf '%s\n' '0, GPU-0000, 595.84'
+        ;;
+    *)
+        printf '%s\n' '0, GPU-0000, 595.84' '1, GPU-0001, 595.84'
+        ;;
+esac
+EOF
+cat >"$TMP_ROOT/bin/modinfo" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 700 "$TMP_ROOT/bin/nvidia-smi" "$TMP_ROOT/bin/modinfo"
+# shellcheck disable=SC1090
+source "$TMP_ROOT/nvidia-health-function.sh"
+NVIDIA_EXPECTED_COUNT=''
+NVIDIA_EXPECTED_DRIVER=''
+NVIDIA_HEALTH_REASON=''
+NVIDIA_PROC_VERSION_FILE="$TMP_ROOT/no-nvidia-version"
+export NVIDIA_PROC_VERSION_FILE
+NVIDIA_STUB_MODE=mismatch
+export NVIDIA_STUB_MODE
+if nvidia_health_check test "$TMP_ROOT/nvidia-health.log"; then
+    fail 'NVML driver/library mismatch is rejected'
+else
+    assert_eq 'NVML mismatch has a precise reason' 'driver-library-version-mismatch' "$NVIDIA_HEALTH_REASON"
+fi
+NVIDIA_STUB_MODE=healthy
+nvidia_health_check baseline "$TMP_ROOT/nvidia-health.log" ||
+    fail 'healthy two-GPU inventory is accepted'
+NVIDIA_STUB_MODE=one
+if nvidia_health_check changed "$TMP_ROOT/nvidia-health.log"; then
+    fail 'GPU inventory change is rejected'
+else
+    assert_eq 'GPU inventory change has a precise reason' 'inventory-changed' "$NVIDIA_HEALTH_REASON"
+fi
+rm -f -- "$TMP_ROOT/bin/nvidia-smi" "$TMP_ROOT/bin/modinfo"
+
+# 模拟 apt 计划触碰 libnvidia；保护逻辑必须在真实安装前退出。
+{
+    awk '/^packages_for_commands\(\) {/,/^}/' "$SCRIPT"
+    awk '/^install_deps\(\) {/,/^}/' "$SCRIPT"
+} >"$TMP_ROOT/dependency-functions.sh"
+cat >"$TMP_ROOT/bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+    *' update '*) exit 0 ;;
+    *' --simulate '*) printf '%s\n' 'Inst libnvidia-compute-595 (595.91 Ubuntu:stable)'; exit 0 ;;
+    *) printf 'unsafe\n' >"${APT_ACTUAL_MARKER:?}"; exit 0 ;;
+esac
+EOF
+chmod 700 "$TMP_ROOT/bin/apt-get"
+set +e
+apt_output="$(
+    export APT_ACTUAL_MARKER="$TMP_ROOT/apt-actual"
+    DRY=0 SAFE=0 NO_INSTALL=0
+    missing() { printf 'fio\n'; }
+    log() { printf '%s\n' "$*" >&2; }
+    die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+    sudo() { "$@"; }
+    source "$TMP_ROOT/dependency-functions.sh"
+    install_deps 2>&1
+)"
+apt_rc=$?
+set -e
+assert_eq 'apt NVIDIA transaction is rejected' '2' "$apt_rc"
+assert_contains 'apt rejection explains NVIDIA protection' "$apt_output" 'refusing dependency transaction'
+assert_true 'apt rejection occurs before real installation' test ! -e "$TMP_ROOT/apt-actual"
+rm -f -- "$TMP_ROOT/bin/apt-get"
 
 # 内嵌的 Python 助手运行时才落盘、结束即删除，所以从源码里提取出来单独编译
 if python3 "$SCRIPT_DIR/extract-helpers.py" "$SCRIPT" "$TMP_ROOT/helpers" >"$TMP_ROOT/helpers.list" 2>&1; then
@@ -160,6 +264,47 @@ if python3 "$SCRIPT_DIR/extract-helpers.py" "$SCRIPT" "$TMP_ROOT/helpers" >"$TMP
 else
     fail 'embedded Python helpers extracted' "$(<"$TMP_ROOT/helpers.list")"
     fail 'embedded Python helpers compile' 'extraction failed'
+fi
+
+# GPU 阶段的 Xid 只能改判 GPU；此前通过的 CPU、内存和磁盘必须保持 PASS。
+HEALTH_FIXTURE="$TMP_ROOT/health-attribution"
+mkdir -p -- "$HEALTH_FIXTURE/raw" "$HEALTH_FIXTURE/telemetry" "$HEALTH_FIXTURE/work"
+printf '{}\n' >"$HEALTH_FIXTURE/work/context.json"
+printf '{}\n' >"$HEALTH_FIXTURE/environment.json"
+cat >"$HEALTH_FIXTURE/results.tsv" <<'EOF'
+cpu	PASS	10	10	cpu ok
+memory	PASS	10	10	memory ok
+disk	PASS	10	10	disk ok
+gpu	PASS	10	10	gpu process exited zero
+mixed	INCOMPLETE	10	0	skipped after GPU fault
+EOF
+printf '{"boot_id":"boot-a","xid":0}\n' >"$HEALTH_FIXTURE/health-gpu-before.json"
+printf '{"boot_id":"boot-a","xid":1}\n' >"$HEALTH_FIXTURE/health-gpu-after.json"
+printf '{"boot_id":"boot-a","xid":0}\n' >"$HEALTH_FIXTURE/health-run-before.json"
+printf '{"boot_id":"boot-a","xid":1}\n' >"$HEALTH_FIXTURE/health-run-after.json"
+awk '/^critical_health_delta\(\) {/,/^}/' "$SCRIPT" >"$TMP_ROOT/critical-health-function.sh"
+# shellcheck disable=SC1090
+source "$TMP_ROOT/critical-health-function.sh"
+RUN="$HEALTH_FIXTURE"
+assert_eq 'GPU Xid is detected before mixed stage starts' 'xid+1' "$(critical_health_delta gpu)"
+if python3 "$TMP_ROOT/helpers/summarize.py" "$HEALTH_FIXTURE" >/dev/null 2>&1 &&
+        python3 - "$HEALTH_FIXTURE/results.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as handle:
+    result = json.load(handle)
+stages = {item['stage']: item for item in result['stages']}
+assert result['overall'] == 'FAIL'
+assert stages['cpu']['status'] == 'PASS'
+assert stages['memory']['status'] == 'PASS'
+assert stages['disk']['status'] == 'PASS'
+assert stages['gpu']['status'] == 'FAIL'
+PY
+then
+    pass 'GPU critical health fault is attributed only to GPU stage'
+else
+    fail 'GPU critical health fault is attributed only to GPU stage'
 fi
 
 # ---------------------------------------------------------------------------
@@ -241,7 +386,7 @@ assert_contains 'report includes telemetry section' "$(<"$REPORT_1")" '五、运
 assert_contains 'report includes health counter table' "$(<"$REPORT_1")" '六、健康计数差值'
 assert_not_contains 'report leaves no unformatted placeholder' "$(<"$REPORT_1")" '%s'
 invoke version
-assert_contains 'version reports 3.1.1' "$LAST_OUTPUT" '3.1.1'
+assert_contains 'version reports 3.1.2' "$LAST_OUTPUT" '3.1.2'
 
 stage_sum="$(python3 - "$REPORT_1" <<'PY'
 import re
