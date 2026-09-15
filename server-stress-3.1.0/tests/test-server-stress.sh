@@ -164,6 +164,8 @@ assert_true 'mixed GPU timeout is not accepted as success' grep -Fq \
     '((gpu_rc == 0)) || rc=1' "$SCRIPT"
 assert_true 'GPU critical health guard skips mixed load' grep -Fq \
     '((GPU_DRIVER_UNHEALTHY || GPU_CRITICAL_HEALTH))' "$SCRIPT"
+assert_true 'parameterized email run uses interactive QQ prompt' \
+    test "$(grep -c '^[[:space:]]*prompt_qq_mail_for_run$' "$SCRIPT")" -eq 2
 
 # fio 的 --filename 必须是绝对路径。传相对路径时它只在 --directory 已被解析的
 # 情况下才落到测试目录，否则会写到当前工作目录去 —— 那测的就不是目标磁盘了。
@@ -589,6 +591,30 @@ assert_not_contains 'QQ authorization code is not printed' "$LAST_OUTPUT" "$QQ_S
 assert_eq 'QQ authorization file contains entered code' "$QQ_SENTINEL" "$(<"$QQ_AUTH")"
 invoke_stdin_with_home $'sender@qq.com\n'"$QQ_SENTINEL"$'\n' setup-qq-mail
 assert_eq 'QQ setup refuses to overwrite saved credentials' '2' "$LAST_RC"
+
+# 直接运行与带 --email 的终端运行共用此输入流程；它应安全替换已有配置，
+# 且发件邮箱、授权码、收件邮箱均来自本次输入。
+awk '/^valid_qq_email\(\) {/,/^}/' "$SCRIPT" >"$TMP_ROOT/qq-prompt-functions.sh"
+awk '/^config_check\(\) {/,/^}/' "$SCRIPT" >>"$TMP_ROOT/qq-prompt-functions.sh"
+awk '/^prompt_qq_mail_for_run\(\) {/,/^}/' "$SCRIPT" >>"$TMP_ROOT/qq-prompt-functions.sh"
+# shellcheck disable=SC1090
+source "$TMP_ROOT/qq-prompt-functions.sh"
+die() { printf 'ERROR: %s\n' "$*" >&2; return 2; }
+CONFIG="$QQ_CONFIG"
+EMAIL_RECIPIENT=''
+QQ_NEW_SENTINEL='NewQQAuth_6f52d1'
+QQ_PROMPT_OUTPUT=$(
+    printf 'newsender@qq.com\n%s\nreceiver@qq.com\n' "$QQ_NEW_SENTINEL" |
+        prompt_qq_mail_for_run 2>&1
+)
+QQ_PROMPT_RC=$?
+assert_eq 'interactive QQ mail prompt succeeds' '0' "$QQ_PROMPT_RC"
+assert_contains 'interactive QQ prompt saves sender' "$(<"$QQ_CONFIG")" 'from = newsender@qq.com'
+assert_contains 'interactive QQ prompt saves recipient' "$(<"$QQ_CONFIG")" 'to = receiver@qq.com'
+assert_eq 'interactive QQ prompt replaces authorization code' "$QQ_NEW_SENTINEL" "$(<"$QQ_AUTH")"
+assert_not_contains 'interactive QQ prompt never prints authorization code' "$QQ_PROMPT_OUTPUT" "$QQ_NEW_SENTINEL"
+assert_eq 'interactive QQ prompt keeps config private' '600' "$(stat -c '%a' "$QQ_CONFIG")"
+assert_eq 'interactive QQ prompt keeps authorization private' '600' "$(stat -c '%a' "$QQ_AUTH")"
 rm -rf -- "$TMP_ROOT/home"
 
 # 权限过宽的配置必须在 Python/smtplib 发起连接之前就被拒绝；下面的主机名永远不会被访问

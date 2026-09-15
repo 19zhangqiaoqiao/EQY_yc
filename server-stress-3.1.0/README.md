@@ -92,10 +92,10 @@ sha256sum --check server-stress-3.1.0.tar.gz.sha256
 ```bash
 git clone https://github.com/19zhangqiaoqiao/EQY_yc.git
 cd EQY_yc
-bash server-stress.sh                                # 交互输入 ID、收件 QQ 邮箱并开始
+bash server-stress.sh                                # 交互输入 ID 和三项 QQ 邮件信息并开始
 ```
 
-首次交互运行还会配置 QQ 发件邮箱与 SMTP 授权码；后续运行仅输入任务 ID 和收件 QQ 邮箱。屏幕会显示阶段开始、阶段结论和报告/邮件状态。
+每次交互运行都会按顺序输入任务 ID、发件 QQ 邮箱、隐藏的 SMTP 授权码和收件 QQ 邮箱。屏幕会显示阶段开始、阶段结论和报告/邮件状态。
 
 QQ 发件邮箱必须在网页端开启 SMTP 服务并生成“授权码”，不能使用 QQ 登录密码。授权码只会保存在当前用户的 `~/.config/server-stress/qq-smtp-auth`，配置目录权限是 `0700`，配置与授权码文件权限均为 `0600`；它们不会进入 Git、日志、报告或证据归档。
 
@@ -115,7 +115,7 @@ cd server-stress-3.1.0
 bash server-stress.sh run --id host2-1h --duration 1h --email
 ```
 
-`--email` 需要本机先有 `~/.config/server-stress/smtp.conf`（`init-config` 生成，权限 600）。没有邮件配置也能跑，只是不发信，报告仍然落在运行目录里。
+带 `--email` 的参数命令在终端中会同样询问发件 QQ 邮箱、隐藏的 SMTP 授权码和收件 QQ 邮箱，不需要先执行配置命令。无终端的自动化任务仍需提前准备权限为 600 的 SMTP 配置。没有 `--email` 也能跑，只是不发信，报告仍然落在运行目录里。
 
 ## 快速开始
 
@@ -306,16 +306,15 @@ unset SERVER_STRESS_SMTP_PASSWORD
 
 ### QQ 邮箱交互式配置
 
-直接执行仓库根目录的 `bash server-stress.sh` 时，脚本会询问任务 ID、收件 QQ 邮箱；首次使用还会询问发件 QQ 邮箱与隐藏输入的 SMTP 授权码，并自动生成安全配置：
+直接执行仓库根目录的 `bash server-stress.sh` 时，脚本会依次询问任务 ID、发件 QQ 邮箱、隐藏输入的 SMTP 授权码和收件 QQ 邮箱，并自动生成安全配置：
 
 ```bash
 bash server-stress.sh
 ```
 
-QQ 邮箱网页端必须先开启 SMTP 服务。输入的是 QQ 邮箱生成的“授权码”，不是 QQ 登录密码。授权码独立保存为 `~/.config/server-stress/qq-smtp-auth`，SMTP 配置保存为 `~/.config/server-stress/smtp.conf`；目录权限为 `0700`，两个文件权限均为 `0600`。需要更换发件 QQ 邮箱时，先安全删除这两个私有文件，再运行：
+QQ 邮箱网页端必须先开启 SMTP 服务。输入的是 QQ 邮箱生成的“授权码”，不是 QQ 登录密码。授权码独立保存为 `~/.config/server-stress/qq-smtp-auth`，SMTP 配置保存为 `~/.config/server-stress/smtp.conf`；目录权限为 `0700`，两个文件权限均为 `0600`。下一次运行时会安全替换为本次输入，不需要手动删除旧配置。也可以单独执行首次配置命令：
 
 ```bash
-rm -f ~/.config/server-stress/smtp.conf ~/.config/server-stress/qq-smtp-auth
 bash server-stress.sh setup-qq-mail
 ```
 

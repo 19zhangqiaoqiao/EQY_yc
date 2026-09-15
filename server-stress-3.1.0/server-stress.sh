@@ -38,6 +38,7 @@ NO_INSTALL=0
 DRY=0
 SAFE=0
 EMAIL=0
+EMAIL_RECIPIENT=''
 REPORT_FORMAT=both          # md | docx | both
 TELE_INTERVAL=5             # 遥测采样间隔（秒）
 DISK_ENGINE=auto            # auto | libaio | io_uring | sync
@@ -99,7 +100,8 @@ usage() {
     cat <<'EOF'
 Usage: server-stress.sh [run|preflight|status|init-config|setup-qq-mail|help|version] [options]
 
-直接执行且在终端中运行时，会交互输入任务 ID、收件 QQ 邮箱；首次还会配置 QQ 发件邮箱。
+直接执行且在终端中运行时，会交互输入任务 ID、发件 QQ 邮箱、SMTP 授权码和收件 QQ 邮箱。
+带 --email 的 run 命令在终端中也会进行相同的邮件输入；授权码隐藏显示。
 QQ 发件邮箱必须在网页端开启 SMTP 并使用授权码，不能输入 QQ 登录密码。
 
 通用选项
@@ -1655,6 +1657,81 @@ EOF
     printf 'QQ 邮件配置已保存到 %s（授权码单独保存，权限 600）。\n' "$config_dir"
 }
 
+prompt_qq_mail_for_run() {
+    local config_dir auth_file sender auth recipient temp_auth temp_config
+    config_dir=$(dirname -- "$CONFIG")
+    auth_file="$config_dir/qq-smtp-auth"
+
+    [[ $CONFIG == /* ]] || die 'SMTP configuration path must be absolute'
+    [[ ! -L $config_dir && ! -L $CONFIG && ! -L $auth_file ]] ||
+        die 'QQ SMTP paths must not be symbolic links'
+    if [[ -e $CONFIG ]]; then
+        config_check "$CONFIG" ||
+            die 'existing SMTP config must be caller-owned, regular, non-symlink, mode 0400/0600'
+    fi
+    if [[ -e $auth_file ]]; then
+        config_check "$auth_file" ||
+            die 'existing SMTP authorization file must be caller-owned, regular, non-symlink, mode 0400/0600'
+    fi
+
+    printf '\n请输入本次报告的 QQ 邮件信息。\n'
+    while :; do
+        read -r -p '发件 QQ 邮箱：' sender
+        valid_qq_email "$sender" && break
+        printf '请输入有效的 QQ 邮箱，例如 123456@qq.com。\n' >&2
+    done
+    while :; do
+        read -r -s -p 'QQ SMTP 授权码（隐藏输入）：' auth
+        printf '\n'
+        [[ -n $auth && ${#auth} -le 128 && $auth != *$'\n'* && $auth != *$'\r'* ]] && break
+        printf '授权码不能为空。\n' >&2
+    done
+    while :; do
+        read -r -p '收件 QQ 邮箱：' recipient
+        valid_qq_email "$recipient" && break
+        printf '请输入有效的 QQ 邮箱，例如 123456@qq.com。\n' >&2
+    done
+
+    mkdir -p -- "$config_dir"
+    [[ -d $config_dir && ! -L $config_dir && $(stat -c %u "$config_dir") -eq $EUID ]] ||
+        die 'SMTP configuration directory must be caller-owned and must not be a symbolic link'
+    chmod 700 "$config_dir"
+    temp_auth=$(mktemp "${auth_file}.XXXXXXXX") || die 'cannot create temporary SMTP authorization file'
+    temp_config=$(mktemp "${CONFIG}.XXXXXXXX") || {
+        rm -f -- "$temp_auth"
+        die 'cannot create temporary SMTP config'
+    }
+    (
+        umask 077
+        printf '%s\n' "$auth" >"$temp_auth"
+        cat >"$temp_config" <<EOF
+[smtp]
+host = smtp.qq.com
+port = 465
+security = ssl
+username = $sender
+from = $sender
+to = $recipient
+password_env =
+password_file = $auth_file
+timeout = 30
+max_attachment_bytes = 26214400
+attach_archive = true
+EOF
+    ) || {
+        rm -f -- "$temp_auth" "$temp_config"
+        unset auth
+        die 'cannot write QQ SMTP configuration'
+    }
+    unset auth
+    chmod 600 "$temp_auth" "$temp_config"
+    mv -f -- "$temp_auth" "$auth_file"
+    mv -f -- "$temp_config" "$CONFIG"
+    chmod 600 "$auth_file" "$CONFIG"
+    EMAIL_RECIPIENT=$recipient
+    printf '邮件信息已安全保存；报告将发送到 %s。\n' "$recipient"
+}
+
 set_qq_recipient() {
     local recipient=$1 temp
     valid_qq_email "$recipient" || die 'recipient must be a valid QQ email address'
@@ -1823,7 +1900,6 @@ show_status() {
 }
 
 interactive_run() {
-    local recipient
     [[ -t 0 && -t 1 ]] || die '无参数交互模式需要终端；自动化请使用 run --id ... --email'
 
     parse
@@ -1834,18 +1910,9 @@ interactive_run() {
         valid_id "$ID" && break
         printf 'ID 只能包含字母、数字、点、下划线和连字符，且首字符必须是字母或数字。\n' >&2
     done
-    while :; do
-        read -r -p '收件 QQ 邮箱：' recipient
-        valid_qq_email "$recipient" && break
-        printf '请输入有效 QQ 邮箱，例如 123456@qq.com。\n' >&2
-    done
-
-    if [[ ! -e $CONFIG && ! -L $CONFIG ]]; then
-        setup_qq_mail
-    fi
-    set_qq_recipient "$recipient"
+    prompt_qq_mail_for_run
     EMAIL=1
-    printf '\n任务 %s 将完成全量压测，报告会发往 %s。\n' "$ID" "$recipient"
+    printf '\n任务 %s 将完成全量压测，报告会发往 %s。\n' "$ID" "$EMAIL_RECIPIENT"
     runall
 }
 
@@ -1854,7 +1921,13 @@ main() {
     local cmd=$1
     shift
     case $cmd in
-        run) parse "$@"; runall ;;
+        run)
+            parse "$@"
+            if ((EMAIL)) && [[ -t 0 && -t 1 ]]; then
+                prompt_qq_mail_for_run
+            fi
+            runall
+            ;;
         preflight) parse "$@"; ((EMAIL == 0)) || die '--email only applies to run'; preflight ;;
         status) parse "$@"; show_status ;;
         init-config) init_config "$@" ;;
